@@ -1,0 +1,26 @@
+# Dependencies
+node_modules
+
+# Environment & local
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+
+# Project-specific
+workflow/.env
+workflow/multichain/node_modules
+
+contracts/.env
+contracts/.DS_Store
+contracts/node_modules
+contracts/out
+contracts/cache
+contracts/artifacts
+contracts/build
+contracts/coverage
+contracts/dist
+contracts/docs
+contracts/lib

@@ -1,0 +1,6 @@
+*.env
+
+.env
+
+.DS_Store
+multichain/node_modules
