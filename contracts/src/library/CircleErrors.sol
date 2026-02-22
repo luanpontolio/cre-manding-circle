@@ -33,4 +33,5 @@ library CircleErrors {
     error QuotaFull();
     error AlreadySettled();
     error TransferFailed();
+    error WindowNotReadyToClose();
 }

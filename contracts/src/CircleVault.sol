@@ -5,7 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {CircleErrors} from "./libraries/CircleError.sol";
+import {CircleErrors} from "./library/CircleErrors.sol";
 import {PositionNFT} from "./PositionNFT.sol";
 import {ERC20Claim} from "./ERC20Claim.sol";
 import {IDrawConsumer} from "./interfaces/IDrawConsumer.sol";
@@ -13,21 +13,32 @@ import {IDrawConsumer} from "./interfaces/IDrawConsumer.sol";
 contract CircleVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    uint256 private constant SECONDS_PER_DAY = 86400;
+
+    enum WindowPhase {
+        EARLY,   // 0
+        MIDDLE,  // 1
+        LATE     // 2
+    }
+
     struct CircleParams {
         string name;
         uint256 targetValue;
         uint256 totalInstallments;
-        uint256 startTime;
+        uint256 startTimestamp;
+        uint256 totalDurationDays;
         uint256 timePerRound;
         uint256 numRounds;
         uint256 numUsers;
         uint16 exitFeeBps;
+        address paymentToken;
         address shareToken;
         address positionNft;
         uint256 quotaCapEarly;
         uint256 quotaCapMiddle;
         uint256 quotaCapLate;
         address drawConsumer;
+        address vrfWrapper;
     }
 
     enum CircleStatus {
@@ -37,6 +48,7 @@ contract CircleVault is Ownable, ReentrancyGuard {
         CLOSED
     }
 
+    address public immutable paymentToken;
     address public immutable shareToken;
     address public immutable positionNft;
     uint256 public immutable targetValue;
@@ -47,7 +59,8 @@ contract CircleVault is Ownable, ReentrancyGuard {
 
     string public circleName;
     address public creator;
-    uint256 public startTime;
+    uint256 public immutable startTimestamp;
+    uint256 public immutable totalDurationDays;
     uint256 public timePerRound;
     uint256 public numberOfRounds;
     CircleStatus public status;
@@ -69,7 +82,7 @@ contract CircleVault is Ownable, ReentrancyGuard {
     uint256 public snapshotClaimsSupply;
 
     /// Close window (deadline) per quota: when this timestamp is reached, that window can be snapshotted and drawn.
-    /// Early = startTime + timePerRound, Middle = startTime + 2*timePerRound, Late = startTime + 3*timePerRound.
+    /// Offsets: totalDurationDays / 3 per phase. Early = start + 1/3, Middle = start + 2/3, Late = start + total.
     uint256 public immutable closeWindowEarly;
     uint256 public immutable closeWindowMiddle;
     uint256 public immutable closeWindowLate;
@@ -123,6 +136,8 @@ contract CircleVault is Ownable, ReentrancyGuard {
     constructor(CircleParams memory p, address owner_) Ownable(owner_) {
         require(p.targetValue > 0, "Invalid target");
         require(p.totalInstallments > 0, "Invalid installments");
+        require(p.totalDurationDays > 0, "Invalid duration");
+        require(p.paymentToken != address(0), "PaymentToken zero");
         require(p.shareToken != address(0), "ShareToken zero");
         require(p.positionNft != address(0), "NFT zero");
         require(p.exitFeeBps <= 1000, "Fee too high");
@@ -131,11 +146,13 @@ contract CircleVault is Ownable, ReentrancyGuard {
         circleName = p.name;
         targetValue = p.targetValue;
         totalInstallments = p.totalInstallments;
-        startTime = p.startTime;
+        startTimestamp = p.startTimestamp;
+        totalDurationDays = p.totalDurationDays;
         timePerRound = p.timePerRound;
         numberOfRounds = p.numRounds;
         numUsers = p.numUsers;
         exitFeeBps = p.exitFeeBps;
+        paymentToken = p.paymentToken;
         shareToken = p.shareToken;
         positionNft = p.positionNft;
         creator = owner_;
@@ -144,9 +161,13 @@ contract CircleVault is Ownable, ReentrancyGuard {
         quotaCapEarly = p.quotaCapEarly;
         quotaCapMiddle = p.quotaCapMiddle;
         quotaCapLate = p.quotaCapLate;
-        closeWindowEarly = p.startTime + p.timePerRound;
-        closeWindowMiddle = p.startTime + 2 * p.timePerRound;
-        closeWindowLate = p.startTime + 3 * p.timePerRound;
+
+        uint256 totalSeconds = p.totalDurationDays * SECONDS_PER_DAY;
+        uint256 phaseDuration = totalSeconds / 3;
+        closeWindowEarly = p.startTimestamp + phaseDuration;
+        closeWindowMiddle = p.startTimestamp + 2 * phaseDuration;
+        closeWindowLate = p.startTimestamp + totalSeconds;
+
         drawConsumer = p.drawConsumer;
     }
 
@@ -156,6 +177,51 @@ contract CircleVault is Ownable, ReentrancyGuard {
         if (quotaId == 0) return closeWindowEarly;
         if (quotaId == 1) return closeWindowMiddle;
         return closeWindowLate;
+    }
+
+    /// @notice Overload for enum. Returns close timestamp for the given phase.
+    function getCloseWindowTimestamp(WindowPhase phase) external view returns (uint256) {
+        return getCloseWindowTimestamp(uint256(phase));
+    }
+
+    /// @notice Returns the current phase given a timestamp. Before startTimestamp returns EARLY.
+    function getCurrentPhase(uint256 timestamp) public view returns (WindowPhase) {
+        if (timestamp < startTimestamp) return WindowPhase.EARLY;
+        uint256 elapsed = timestamp - startTimestamp;
+        uint256 totalSeconds = totalDurationDays * SECONDS_PER_DAY;
+        uint256 phaseDuration = totalSeconds / 3;
+        if (elapsed < phaseDuration) return WindowPhase.EARLY;
+        if (elapsed < 2 * phaseDuration) return WindowPhase.MIDDLE;
+        return WindowPhase.LATE;
+    }
+
+    /// @notice Sum of claim balances for eligible participants in the window (before snapshot).
+    function getCurrentWindowPot(uint256 quotaId) public view returns (uint256 totalPot) {
+        _requireValidQuota(quotaId);
+        for (uint256 i = 0; i < participants.length; i++) {
+            address p = participants[i];
+            uint256 tokenId = participantToTokenId[p];
+            if (tokenId == 0) continue;
+            PositionNFT.PositionData memory pos = PositionNFT(positionNft).getPosition(tokenId);
+            if (pos.quotaId != quotaId || pos.status != PositionNFT.Status.ACTIVE) continue;
+            uint256 bal = IERC20(shareToken).balanceOf(p);
+            if (bal == 0) continue;
+            totalPot += bal;
+        }
+    }
+
+    /// @notice Can close when: (1) deadline passed OR (2) window pot >= targetValue, and sequential order.
+    function canCloseWindow(uint256 quotaId) public view returns (bool) {
+        if (windowSnapshotted[quotaId]) return false;
+        if (quotaId >= 1 && !windowSnapshotted[0]) return false;
+        if (quotaId >= 2 && !windowSnapshotted[1]) return false;
+
+        uint256 deadline = getCloseWindowTimestamp(quotaId);
+        bool deadlinePassed = block.timestamp >= deadline;
+        uint256 currentPot = getCurrentWindowPot(quotaId);
+        bool potSufficient = currentPot >= targetValue;
+
+        return deadlinePassed || potSufficient;
     }
 
     /// @return Full draw order for the window (for redeem order and off-chain use).
@@ -176,14 +242,15 @@ contract CircleVault is Ownable, ReentrancyGuard {
     }
 
     /// @param quotaId 0 = early, 1 = middle, 2 = late
-    function deposit(uint256 quotaId) external payable nonReentrant() {
+    function deposit(uint256 quotaId) external nonReentrant() {
         _requireActive();
         _requireNotEnrolled(msg.sender);
         if (participants.length >= numUsers) revert CircleErrors.CircleFull();
         _requireValidQuota(quotaId);
         _requireBeforeCloseWindow(quotaId);
         _requireQuotaAvailable(quotaId);
-        if (msg.value != installmentAmount) revert CircleErrors.IncorrectDepositAmount();
+
+        IERC20(paymentToken).safeTransferFrom(msg.sender, address(this), installmentAmount);
 
         _incrementQuotaFilled(quotaId);
 
@@ -200,12 +267,12 @@ contract CircleVault is Ownable, ReentrancyGuard {
         participants.push(msg.sender);
         activeParticipantCount++;
         snapshotTimestamp = block.timestamp;
-        snapshotBalance += msg.value;
-        snapshotClaimsSupply += msg.value;
+        snapshotBalance += installmentAmount;
+        snapshotClaimsSupply += installmentAmount;
 
-        ERC20Claim(shareToken).mint(msg.sender, msg.value);
+        ERC20Claim(shareToken).mint(msg.sender, installmentAmount);
 
-        emit ParticipantEnrolled(msg.sender, tokenId, msg.value);
+        emit ParticipantEnrolled(msg.sender, tokenId, installmentAmount);
     }
 
     function _quotaCapacity(uint256 quotaId) internal view returns (uint256) {
@@ -228,11 +295,11 @@ contract CircleVault is Ownable, ReentrancyGuard {
 
     /// @notice Pay next installment within the same quota window.
     /// Participant remains in their original window and continues participating in future draws.
-    function payInstallment() external payable nonReentrant {
+    function payInstallment() external nonReentrant {
         _requireActive();
         uint256 tokenId = _requireEnrolled(msg.sender);
 
-        if (msg.value != installmentAmount) revert CircleErrors.IncorrectInstallmentAmount();
+        IERC20(paymentToken).safeTransferFrom(msg.sender, address(this), installmentAmount);
 
         PositionNFT.PositionData memory positionData = PositionNFT(positionNft).getPosition(tokenId);
         if (positionData.paidInstallments >= positionData.totalInstallments) revert CircleErrors.PositionFullyPaid();
@@ -241,19 +308,19 @@ contract CircleVault is Ownable, ReentrancyGuard {
 
         // Participant stays in the same quotaId - no window changes
         positionData.paidInstallments++;
-        positionData.totalPaid += msg.value;
+        positionData.totalPaid += installmentAmount;
 
-        snapshotBalance += msg.value;
-        snapshotClaimsSupply += msg.value;
+        snapshotBalance += installmentAmount;
+        snapshotClaimsSupply += installmentAmount;
 
         PositionNFT(positionNft).updatePaid(tokenId, positionData.paidInstallments, positionData.totalPaid);
-        ERC20Claim(shareToken).mint(msg.sender, msg.value);
+        ERC20Claim(shareToken).mint(msg.sender, installmentAmount);
 
         if (positionData.paidInstallments >= positionData.totalInstallments) {
             PositionNFT(positionNft).setStatus(tokenId, PositionNFT.Status.CLOSED);
         }
 
-        emit InstallmentPaid(msg.sender, tokenId, msg.value, positionData.totalPaid);
+        emit InstallmentPaid(msg.sender, tokenId, installmentAmount, positionData.totalPaid);
     }
 
     function exitEarly(uint256 claimAmount) external nonReentrant() {
@@ -269,7 +336,7 @@ contract CircleVault is Ownable, ReentrancyGuard {
 
         uint256 feeAmount = (claimAmount * exitFeeBps) / 10_000;
         uint256 netAmount = claimAmount - feeAmount;
-        if (address(this).balance < netAmount) revert CircleErrors.InsufficientBalance();
+        if (IERC20(paymentToken).balanceOf(address(this)) < netAmount) revert CircleErrors.InsufficientBalance();
         if (snapshotBalance < netAmount) revert CircleErrors.InsufficientBalance();
         if (snapshotClaimsSupply < claimAmount) revert CircleErrors.InsufficientSnapshot();
 
@@ -281,7 +348,7 @@ contract CircleVault is Ownable, ReentrancyGuard {
         ERC20Claim(shareToken).burn(address(this), claimAmount);
         PositionNFT(positionNft).setStatus(tokenId, PositionNFT.Status.EXITED);
 
-        _sendEth(msg.sender, netAmount);
+        IERC20(paymentToken).safeTransfer(msg.sender, netAmount);
 
         emit EarlyExit(msg.sender, tokenId, claimAmount, feeAmount, netAmount);
     }
@@ -290,12 +357,12 @@ contract CircleVault is Ownable, ReentrancyGuard {
         return participantToTokenId[participant] != 0;
     }
 
-    /// @notice Snapshot a payout window and request VRF draw via DrawConsumer. Callable when block.timestamp >= getCloseWindowTimestamp(quotaId).
+    /// @notice Snapshot a payout window and request VRF draw via DrawConsumer. Callable when canCloseWindow(quotaId).
     /// @param quotaId 0 = early, 1 = middle, 2 = late
     function requestCloseWindow(uint256 quotaId) external nonReentrant {
         _requireActive();
         _requireValidQuota(quotaId);
-        _requireAfterCloseWindow(quotaId);
+        if (!canCloseWindow(quotaId)) revert CircleErrors.WindowNotReadyToClose();
         if (windowSnapshotted[quotaId]) revert CircleErrors.AlreadySnapshotted();
 
         uint256 participantCount = _snapshotWindow(quotaId);
@@ -322,7 +389,7 @@ contract CircleVault is Ownable, ReentrancyGuard {
 
         uint256 potAmount = windowTotalPot[quotaId];
         if (potAmount == 0) revert CircleErrors.ZeroAmount();
-        if (address(this).balance < potAmount) revert CircleErrors.InsufficientBalance();
+        if (IERC20(paymentToken).balanceOf(address(this)) < potAmount) revert CircleErrors.InsufficientBalance();
         if (snapshotBalance < potAmount) revert CircleErrors.InsufficientBalance();
 
         windowSettled[quotaId] = true;
@@ -339,13 +406,13 @@ contract CircleVault is Ownable, ReentrancyGuard {
         // Non-selected participants keep their claims for next rounds
         // No additional claims are burned for other participants
 
-        _sendEth(msg.sender, potAmount);
+        IERC20(paymentToken).safeTransfer(msg.sender, potAmount);
 
         bytes32 proof = keccak256(abi.encodePacked(quotaId, msg.sender, potAmount, block.timestamp));
         emit Redeemed(msg.sender, tokenId, quotaId, potAmount, proof);
     }
 
-    /// @return Full pot (ETH) the single contemplado receives for this window; 0 if window already settled.
+    /// @return Full pot (payment token) the single contemplado receives for this window; 0 if window already settled.
     function getWindowPotShare(uint256 quotaId) external view returns (uint256) {
         if (windowSettled[quotaId]) return 0;
         return windowTotalPot[quotaId];
@@ -407,11 +474,6 @@ contract CircleVault is Ownable, ReentrancyGuard {
     function _requestDraw(uint256 quotaId) internal {
         uint256 requestId = IDrawConsumer(drawConsumer).requestDraw(quotaId, windowParticipants[quotaId]);
         quotaIdToRequestId[quotaId] = requestId;
-    }
-
-    function _sendEth(address to, uint256 amount) internal {
-        (bool sent,) = to.call{value: amount}("");
-        if (!sent) revert CircleErrors.TransferFailed();
     }
 
     receive() external payable {
