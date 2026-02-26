@@ -8,6 +8,8 @@ import {ERC20Claim} from "../src/ERC20Claim.sol";
 contract DeployCircleVault is Script {
     // USDC on Base Sepolia: 0x036CbD53842c5426634e7929541eC2318f3dCF7e
     address constant USDC_BASE_SEPOLIA = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
+    // VRF Wrapper Base Sepolia: 0x7a1BaC17Ccc5b313516C5E16fb24f7659aA5ebed
+    address constant VRF_WRAPPER_BASE_SEPOLIA = 0x7a1BaC17Ccc5b313516C5E16fb24f7659aA5ebed;
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
 
@@ -31,7 +33,8 @@ contract DeployCircleVault is Script {
             quotaCapEarly: 34,
             quotaCapMiddle: 33,
             quotaCapLate: 33,
-            drawConsumer: address(0) // TODO: deploy DrawConsumer first
+            drawConsumer: address(0), // TODO: deploy DrawConsumer first
+            vrfWrapper: VRF_WRAPPER_BASE_SEPOLIA
         });
 
         CircleVault vault = new CircleVault(params, msg.sender);

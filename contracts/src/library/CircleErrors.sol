@@ -34,4 +34,5 @@ library CircleErrors {
     error AlreadySettled();
     error TransferFailed();
     error WindowNotReadyToClose();
+    error InvalidRoundIndex();
 }

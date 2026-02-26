@@ -92,19 +92,22 @@ contract CircleVault is Ownable, ReentrancyGuard {
 
     uint256 private constant MAX_QUOTA_ID = 2;
 
-    /// Per-window snapshot: participants and balances at close time.
-    mapping(uint256 => address[]) public windowParticipants;
-    mapping(uint256 => mapping(address => uint256)) public windowSnapshotBalance;
-    mapping(uint256 => bool) public windowSnapshotted;
-    mapping(uint256 => uint256) public windowSnapshotTimestamp;
-    /// Total pot per window (sum of all snapshot balances). Single contemplado receives full windowTotalPot.
-    mapping(uint256 => uint256) public windowTotalPot;
+    /// Per-window per-round snapshot: (quotaId, roundIndex) -> participants and balances.
+    mapping(uint256 => mapping(uint256 => address[])) public windowParticipants;
+    mapping(uint256 => mapping(uint256 => mapping(address => uint256))) public windowSnapshotBalance;
+    mapping(uint256 => mapping(uint256 => bool)) public windowSnapshotted;
+    mapping(uint256 => mapping(uint256 => uint256)) public windowSnapshotTimestamp;
+    /// Total pot per round (sum of snapshot balances). Single contemplado receives full pot.
+    mapping(uint256 => mapping(uint256 => uint256)) public windowTotalPot;
 
-    /// Draw consumer request id per quota (used to read order and completion from DrawConsumer).
-    mapping(uint256 => uint256) public quotaIdToRequestId;
+    /// Draw consumer request id per (quotaId, roundIndex).
+    mapping(uint256 => mapping(uint256 => uint256)) public quotaIdRoundToRequestId;
 
-    /// True after the single redeem for that window (spec: at most one payout per window).
-    mapping(uint256 => bool) public windowSettled;
+    /// True after redeem for that round (quotaId, roundIndex).
+    mapping(uint256 => mapping(uint256 => bool)) public windowRoundSettled;
+
+    /// True if address has redeemed in that window (excluded from future round snapshots).
+    mapping(uint256 => mapping(address => bool)) public hasRedeemedInWindow;
 
     event ParticipantEnrolled(
         address indexed participant,
@@ -124,7 +127,7 @@ contract CircleVault is Ownable, ReentrancyGuard {
         uint256 feeAmount,
         uint256 netAmount
     );
-    event WindowSnapshotted(uint256 indexed quotaId, uint256 timestamp, uint256 participantCount);
+    event WindowSnapshotted(uint256 indexed quotaId, uint256 indexed roundIndex, uint256 timestamp, uint256 participantCount);
     event Redeemed(
         address indexed participant,
         uint256 indexed tokenId,
@@ -195,11 +198,39 @@ contract CircleVault is Ownable, ReentrancyGuard {
         return WindowPhase.LATE;
     }
 
-    /// @notice Sum of claim balances for eligible participants in the window (before snapshot).
-    function getCurrentWindowPot(uint256 quotaId) public view returns (uint256 totalPot) {
+    /// @notice Rounds per phase (numRounds / 3). Must be divisible at creation.
+    function getRoundsPerPhase() public view returns (uint256) {
+        return numberOfRounds / 3;
+    }
+
+    /// @notice Start timestamp of the given phase (quotaId).
+    function getPhaseStartTimestamp(uint256 quotaId) internal view returns (uint256) {
+        uint256 totalSeconds = totalDurationDays * SECONDS_PER_DAY;
+        uint256 phaseDuration = totalSeconds / 3;
+        return startTimestamp + uint256(quotaId) * phaseDuration;
+    }
+
+    /// @notice Current round index (0-based) within the phase. Returns roundsPerPhase if past phase end.
+    function getCurrentRoundIndex(uint256 quotaId) public view returns (uint256) {
         _requireValidQuota(quotaId);
+        if (block.timestamp < startTimestamp) return 0;
+        uint256 phaseStart = getPhaseStartTimestamp(quotaId);
+        if (block.timestamp < phaseStart) return 0;
+        uint256 elapsedInPhase = block.timestamp - phaseStart;
+        uint256 roundIdx = elapsedInPhase / timePerRound;
+        uint256 roundsPerPhase = getRoundsPerPhase();
+        if (roundIdx >= roundsPerPhase) return roundsPerPhase - 1;
+        return roundIdx;
+    }
+
+    /// @notice Sum of claim balances for eligible participants (excl. those who already redeemed in this window).
+    function getCurrentWindowPot(uint256 quotaId, uint256 roundIndex) public view returns (uint256 totalPot) {
+        _requireValidQuota(quotaId);
+        uint256 roundsPerPhase = getRoundsPerPhase();
+        if (roundIndex >= roundsPerPhase) revert CircleErrors.InvalidRoundIndex();
         for (uint256 i = 0; i < participants.length; i++) {
             address p = participants[i];
+            if (hasRedeemedInWindow[quotaId][p]) continue;
             uint256 tokenId = participantToTokenId[p];
             if (tokenId == 0) continue;
             PositionNFT.PositionData memory pos = PositionNFT(positionNft).getPosition(tokenId);
@@ -210,35 +241,52 @@ contract CircleVault is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @notice Can close when: (1) deadline passed OR (2) window pot >= targetValue, and sequential order.
-    function canCloseWindow(uint256 quotaId) public view returns (bool) {
-        if (windowSnapshotted[quotaId]) return false;
-        if (quotaId >= 1 && !windowSnapshotted[0]) return false;
-        if (quotaId >= 2 && !windowSnapshotted[1]) return false;
+    /// @notice Can close round when: (1) round deadline passed OR (2) pot sufficient, and sequential order.
+    function canCloseWindow(uint256 quotaId, uint256 roundIndex) public view returns (bool) {
+        _requireValidQuota(quotaId);
+        uint256 roundsPerPhase = getRoundsPerPhase();
+        if (roundIndex >= roundsPerPhase) return false;
+        if (windowSnapshotted[quotaId][roundIndex]) return false;
 
-        uint256 deadline = getCloseWindowTimestamp(quotaId);
-        bool deadlinePassed = block.timestamp >= deadline;
-        uint256 currentPot = getCurrentWindowPot(quotaId);
+        // Previous round in same window must be settled
+        if (roundIndex > 0 && !windowRoundSettled[quotaId][roundIndex - 1]) return false;
+
+        // All rounds of previous windows must be settled
+        if (quotaId >= 1) {
+            for (uint256 r = 0; r < roundsPerPhase; r++) {
+                if (!windowRoundSettled[0][r]) return false;
+            }
+        }
+        if (quotaId >= 2) {
+            for (uint256 r = 0; r < roundsPerPhase; r++) {
+                if (!windowRoundSettled[1][r]) return false;
+            }
+        }
+
+        uint256 phaseStart = getPhaseStartTimestamp(quotaId);
+        uint256 roundDeadline = phaseStart + (roundIndex + 1) * timePerRound;
+        bool deadlinePassed = block.timestamp >= roundDeadline;
+        uint256 currentPot = getCurrentWindowPot(quotaId, roundIndex);
         bool potSufficient = currentPot >= targetValue;
 
         return deadlinePassed || potSufficient;
     }
 
-    /// @return Full draw order for the window (for redeem order and off-chain use).
-    function getDrawOrder(uint256 quotaId) external view returns (address[] memory) {
-        uint256 requestId = quotaIdToRequestId[quotaId];
+    /// @return Full draw order for the window round (for redeem order and off-chain use).
+    function getDrawOrder(uint256 quotaId, uint256 roundIndex) external view returns (address[] memory) {
+        uint256 requestId = quotaIdRoundToRequestId[quotaId][roundIndex];
         return IDrawConsumer(drawConsumer).getDrawOrder(requestId);
     }
 
-    /// @return Whether the draw for this window has been fulfilled by the VRF consumer.
-    function drawCompleted(uint256 quotaId) public view returns (bool) {
-        uint256 requestId = quotaIdToRequestId[quotaId];
+    /// @return Whether the draw for this window round has been fulfilled by the VRF consumer.
+    function drawCompleted(uint256 quotaId, uint256 roundIndex) public view returns (bool) {
+        uint256 requestId = quotaIdRoundToRequestId[quotaId][roundIndex];
         return IDrawConsumer(drawConsumer).drawCompleted(requestId);
     }
 
-    /// @return Participants snapshotted for that window.
-    function getWindowParticipants(uint256 quotaId) external view returns (address[] memory) {
-        return windowParticipants[quotaId];
+    /// @return Participants snapshotted for that window round.
+    function getWindowParticipants(uint256 quotaId, uint256 roundIndex) external view returns (address[] memory) {
+        return windowParticipants[quotaId][roundIndex];
     }
 
     /// @param quotaId 0 = early, 1 = middle, 2 = late
@@ -347,6 +395,7 @@ contract CircleVault is Ownable, ReentrancyGuard {
         claimToken.safeTransferFrom(msg.sender, address(this), claimAmount);
         ERC20Claim(shareToken).burn(address(this), claimAmount);
         PositionNFT(positionNft).setStatus(tokenId, PositionNFT.Status.EXITED);
+        participantToTokenId[msg.sender] = 0;
 
         IERC20(paymentToken).safeTransfer(msg.sender, netAmount);
 
@@ -357,65 +406,68 @@ contract CircleVault is Ownable, ReentrancyGuard {
         return participantToTokenId[participant] != 0;
     }
 
-    /// @notice Snapshot a payout window and request VRF draw via DrawConsumer. Callable when canCloseWindow(quotaId).
+    /// @notice Snapshot a payout window round and request VRF draw. Callable when canCloseWindow(quotaId, roundIndex).
     /// @param quotaId 0 = early, 1 = middle, 2 = late
-    function requestCloseWindow(uint256 quotaId) external nonReentrant {
+    /// @param roundIndex 0-based round within the phase
+    function requestCloseWindow(uint256 quotaId, uint256 roundIndex) external nonReentrant {
         _requireActive();
         _requireValidQuota(quotaId);
-        if (!canCloseWindow(quotaId)) revert CircleErrors.WindowNotReadyToClose();
-        if (windowSnapshotted[quotaId]) revert CircleErrors.AlreadySnapshotted();
+        uint256 roundsPerPhase = getRoundsPerPhase();
+        if (roundIndex >= roundsPerPhase) revert CircleErrors.InvalidRoundIndex();
+        if (!canCloseWindow(quotaId, roundIndex)) revert CircleErrors.WindowNotReadyToClose();
+        if (windowSnapshotted[quotaId][roundIndex]) revert CircleErrors.AlreadySnapshotted();
 
-        uint256 participantCount = _snapshotWindow(quotaId);
+        uint256 participantCount = _snapshotWindow(quotaId, roundIndex);
         ERC20Claim(shareToken).setTransfersFrozen(true);
 
-        _requestDraw(quotaId);
+        _requestDraw(quotaId, roundIndex);
 
-        emit WindowSnapshotted(quotaId, block.timestamp, participantCount);
+        emit WindowSnapshotted(quotaId, roundIndex, block.timestamp, participantCount);
     }
 
-    /// @notice Redeem after draw: single contemplado (first in draw order) receives full window pot.
-    /// Non-selected participants keep their claims and can pay next installment to participate in future draws.
-    /// Spec: at most one payout per window; payout_amount(q) <= snapshotBalance(q).
-    function redeem(uint256 quotaId) external nonReentrant {
+    /// @notice Redeem after draw: single contemplado (first in draw order) receives full round pot.
+    /// Non-selected participants keep their claims for future rounds.
+    function redeem(uint256 quotaId, uint256 roundIndex) external nonReentrant {
         _requireValidQuota(quotaId);
-        if (windowSettled[quotaId]) revert CircleErrors.AlreadySettled();
-        if (!drawCompleted(quotaId)) revert CircleErrors.NotSnapshotted();
+        uint256 roundsPerPhase = getRoundsPerPhase();
+        if (roundIndex >= roundsPerPhase) revert CircleErrors.InvalidRoundIndex();
+        if (windowRoundSettled[quotaId][roundIndex]) revert CircleErrors.AlreadySettled();
+        if (!drawCompleted(quotaId, roundIndex)) revert CircleErrors.NotSnapshotted();
 
-        address[] memory order = IDrawConsumer(drawConsumer).getDrawOrder(quotaIdToRequestId[quotaId]);
+        uint256 requestId = quotaIdRoundToRequestId[quotaId][roundIndex];
+        address[] memory order = IDrawConsumer(drawConsumer).getDrawOrder(requestId);
         if (order.length == 0) revert CircleErrors.InvalidParameters();
         if (msg.sender != order[0]) revert CircleErrors.NotSelected();
 
         uint256 tokenId = _requireEnrolled(msg.sender);
 
-        uint256 potAmount = windowTotalPot[quotaId];
+        uint256 potAmount = windowTotalPot[quotaId][roundIndex];
         if (potAmount == 0) revert CircleErrors.ZeroAmount();
         if (IERC20(paymentToken).balanceOf(address(this)) < potAmount) revert CircleErrors.InsufficientBalance();
         if (snapshotBalance < potAmount) revert CircleErrors.InsufficientBalance();
 
-        windowSettled[quotaId] = true;
+        windowRoundSettled[quotaId][roundIndex] = true;
+        hasRedeemedInWindow[quotaId][msg.sender] = true;
         snapshotBalance -= potAmount;
         snapshotClaimsSupply -= potAmount;
 
         // Winner: pull and burn only their own claims
-        uint256 winnerClaimAmount = windowSnapshotBalance[quotaId][msg.sender];
+        uint256 winnerClaimAmount = windowSnapshotBalance[quotaId][roundIndex][msg.sender];
         if (winnerClaimAmount > 0) {
             IERC20(shareToken).safeTransferFrom(msg.sender, address(this), winnerClaimAmount);
             ERC20Claim(shareToken).burn(address(this), winnerClaimAmount);
         }
 
-        // Non-selected participants keep their claims for next rounds
-        // No additional claims are burned for other participants
-
         IERC20(paymentToken).safeTransfer(msg.sender, potAmount);
 
-        bytes32 proof = keccak256(abi.encodePacked(quotaId, msg.sender, potAmount, block.timestamp));
+        bytes32 proof = keccak256(abi.encodePacked(quotaId, roundIndex, msg.sender, potAmount, block.timestamp));
         emit Redeemed(msg.sender, tokenId, quotaId, potAmount, proof);
     }
 
-    /// @return Full pot (payment token) the single contemplado receives for this window; 0 if window already settled.
-    function getWindowPotShare(uint256 quotaId) external view returns (uint256) {
-        if (windowSettled[quotaId]) return 0;
-        return windowTotalPot[quotaId];
+    /// @return Full pot (payment token) the single contemplado receives for this round; 0 if round already settled.
+    function getWindowPotShare(uint256 quotaId, uint256 roundIndex) external view returns (uint256) {
+        if (windowRoundSettled[quotaId][roundIndex]) return 0;
+        return windowTotalPot[quotaId][roundIndex];
     }
 
     function _requireActive() internal view {
@@ -447,11 +499,12 @@ contract CircleVault is Ownable, ReentrancyGuard {
         if (_quotaFilled(quotaId) >= _quotaCapacity(quotaId)) revert CircleErrors.QuotaFull();
     }
 
-    function _snapshotWindow(uint256 quotaId) internal returns (uint256 participantCount) {
-        address[] storage list = windowParticipants[quotaId];
+    function _snapshotWindow(uint256 quotaId, uint256 roundIndex) internal returns (uint256 participantCount) {
+        address[] storage list = windowParticipants[quotaId][roundIndex];
         uint256 totalPot;
         for (uint256 i = 0; i < participants.length; i++) {
             address p = participants[i];
+            if (hasRedeemedInWindow[quotaId][p]) continue;
             uint256 tokenId = participantToTokenId[p];
             if (tokenId == 0) continue;
             PositionNFT.PositionData memory pos = PositionNFT(positionNft).getPosition(tokenId);
@@ -459,21 +512,27 @@ contract CircleVault is Ownable, ReentrancyGuard {
             uint256 bal = IERC20(shareToken).balanceOf(p);
             if (bal == 0) continue;
             list.push(p);
-            windowSnapshotBalance[quotaId][p] = bal;
+            windowSnapshotBalance[quotaId][roundIndex][p] = bal;
             totalPot += bal;
         }
         if (list.length == 0) revert CircleErrors.NoActiveParticipants();
 
-        windowTotalPot[quotaId] = totalPot;
-        windowSnapshotted[quotaId] = true;
-        windowSnapshotTimestamp[quotaId] = block.timestamp;
+        windowTotalPot[quotaId][roundIndex] = totalPot;
+        windowSnapshotted[quotaId][roundIndex] = true;
+        windowSnapshotTimestamp[quotaId][roundIndex] = block.timestamp;
 
         return list.length;
     }
 
-    function _requestDraw(uint256 quotaId) internal {
-        uint256 requestId = IDrawConsumer(drawConsumer).requestDraw(quotaId, windowParticipants[quotaId]);
-        quotaIdToRequestId[quotaId] = requestId;
+    function _requestDraw(uint256 quotaId, uint256 roundIndex) internal {
+        address[] storage list = windowParticipants[quotaId][roundIndex];
+        uint256 n = list.length;
+        address[] memory participantsList = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            participantsList[i] = list[i];
+        }
+        uint256 requestId = IDrawConsumer(drawConsumer).requestDraw(quotaId, participantsList);
+        quotaIdRoundToRequestId[quotaId][roundIndex] = requestId;
     }
 
     receive() external payable {

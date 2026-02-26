@@ -164,7 +164,7 @@ contract CircleVaultTest is Test {
         vm.stopPrank();
 
         vm.warp(vault.startTimestamp() + 1 days);
-        assertFalse(vault.canCloseWindow(0)); // Deadline not passed, pot may not be sufficient
+        assertFalse(vault.canCloseWindow(0, 0)); // Deadline not passed, pot may not be sufficient
     }
 
     function test_CanCloseWindow_AfterDeadline() public {
@@ -174,7 +174,7 @@ contract CircleVaultTest is Test {
         vm.stopPrank();
 
         vm.warp(vault.getCloseWindowTimestamp(0) + 1);
-        assertTrue(vault.canCloseWindow(0));
+        assertTrue(vault.canCloseWindow(0, 0));
     }
 
     function _getPositionData(address participant) internal view returns (

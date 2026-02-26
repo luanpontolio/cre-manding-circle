@@ -34,6 +34,7 @@ contract CircleVaultFactory is Ownable {
     error InvalidExitFee();
     error InvalidTotalInstallments();
     error InvalidRoundsUsers();
+    error InvalidRoundsDivisibility();
     error InvalidQuotaCaps();
 
     constructor() Ownable(msg.sender) {}
@@ -91,6 +92,7 @@ contract CircleVaultFactory is Ownable {
         if (p.exitFeeBps > 500) revert InvalidExitFee();
         if (p.totalInstallments == 0) revert InvalidTotalInstallments();
         if (p.numUsers != p.numRounds) revert InvalidRoundsUsers();
+        if (p.numRounds % 3 != 0) revert InvalidRoundsDivisibility();
         if (p.quotaCapEarly + p.quotaCapMiddle + p.quotaCapLate != p.numUsers) {
             revert InvalidQuotaCaps();
         }

@@ -8,11 +8,12 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 contract MockDrawConsumer is IDrawConsumer, Ownable {
     mapping(uint256 => address[]) private _drawOrder;
     mapping(uint256 => bool) private _drawCompleted;
+    uint256 private _requestIdCounter;
 
     constructor() Ownable(msg.sender) {}
 
     function requestDraw(uint256 quotaId, address[] calldata participants) external override returns (uint256 requestId) {
-        requestId = quotaId; // Use quotaId as requestId for deterministic testing
+        requestId = _requestIdCounter++;
         _drawOrder[requestId] = participants;
         _drawCompleted[requestId] = true;
         return requestId;
